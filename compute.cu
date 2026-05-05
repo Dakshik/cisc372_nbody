@@ -1,6 +1,6 @@
 // Dakshi Kaushik & Rishi Patel
 // CISC 372 - Parallel Computing
-// N-Body Problem - CUDA Implementation (Step 2)
+// N-Body Problem - CUDA Implementation (Step 3 - Shared Memory Optimization)
 
 #include <stdlib.h>
 #include <math.h>
@@ -8,15 +8,34 @@
 #include "vector.h"
 #include "config.h"
 
+#define BLOCK_SIZE 16
+
 static vector3 *dev_Pos = NULL;
 static vector3 *dev_Vel = NULL;
 static double  *dev_mass = NULL;
 static vector3 *dev_accels = NULL;
 static int initialized = 0;
 
+// Kernel 1: Compute pairwise accelerations using shared memory tiling
+// Each thread computes accels[i][j]
+// We load tiles of position and mass into shared memory to reduce global memory reads
 __global__ void computeAccels(vector3 *dev_Pos, double *dev_mass, vector3 *dev_accels, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // Shared memory tiles for position and mass of the j-dimension (source objects)
+    __shared__ double shPos[BLOCK_SIZE][3];
+    __shared__ double shMass[BLOCK_SIZE];
+
+    // Load shared memory: each thread loads one element of the tile
+    int tileJ = blockIdx.y * blockDim.y + threadIdx.y;
+    if (tileJ < n) {
+        shPos[threadIdx.y][0] = dev_Pos[tileJ][0];
+        shPos[threadIdx.y][1] = dev_Pos[tileJ][1];
+        shPos[threadIdx.y][2] = dev_Pos[tileJ][2];
+        shMass[threadIdx.y] = dev_mass[tileJ];
+    }
+    __syncthreads();
 
     if (i >= n || j >= n) return;
 
@@ -28,13 +47,13 @@ __global__ void computeAccels(vector3 *dev_Pos, double *dev_mass, vector3 *dev_a
         vector3 distance;
         int k;
         for (k = 0; k < 3; k++)
-            distance[k] = dev_Pos[i][k] - dev_Pos[j][k];
+            distance[k] = dev_Pos[i][k] - shPos[threadIdx.y][k];
 
         double magnitude_sq = distance[0]*distance[0] +
                               distance[1]*distance[1] +
                               distance[2]*distance[2];
         double magnitude = sqrt(magnitude_sq);
-        double accelmag = -1 * GRAV_CONSTANT * dev_mass[j] / magnitude_sq;
+        double accelmag = -1 * GRAV_CONSTANT * shMass[threadIdx.y] / magnitude_sq;
 
         dev_accels[i * n + j][0] = accelmag * distance[0] / magnitude;
         dev_accels[i * n + j][1] = accelmag * distance[1] / magnitude;
@@ -42,6 +61,8 @@ __global__ void computeAccels(vector3 *dev_Pos, double *dev_mass, vector3 *dev_a
     }
 }
 
+// Kernel 2: Sum accelerations and update positions/velocities
+// Each thread handles one entity i
 __global__ void updateBodies(vector3 *dev_Pos, vector3 *dev_Vel, vector3 *dev_accels, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -77,8 +98,8 @@ extern "C" void compute() {
         initialized = 1;
     }
 
-    dim3 blockDim(16, 16);
-    dim3 gridDim((n + 15) / 16, (n + 15) / 16);
+    dim3 blockDim(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 gridDim((n + BLOCK_SIZE - 1) / BLOCK_SIZE, (n + BLOCK_SIZE - 1) / BLOCK_SIZE);
     computeAccels<<<gridDim, blockDim>>>(dev_Pos, dev_mass, dev_accels, n);
     cudaDeviceSynchronize();
 
